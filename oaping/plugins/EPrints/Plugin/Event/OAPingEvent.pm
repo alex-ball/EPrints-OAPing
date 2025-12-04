@@ -386,8 +386,8 @@ sub notify
 			for my $tuple ( @sorted_accesses[ $size .. $#sorted_accesses ] )
 			{
 				push @stashed, $tuple;
-				my ( $access, $request_url ) = @{$tuple};
-				$self->_stash( $access, $request_url );
+				my ( $deferred_access, $deferred_request_url ) = @{$tuple};
+				$self->_stash( $deferred_access, $deferred_request_url );
 			}
 			$self->_err_log(
 				'Too many stashed access events, saving some for next time.',
@@ -507,7 +507,7 @@ Convert an C<$access> object into a
 L<Matomo Tracking HTTP API|https://developer.matomo.org/api-reference/tracking-api>
 query form.
 
-A request URL will be calculated if not provided.
+A request URL will be calculated if blank or undefined.
 
 Does not insert the C<token_auth> as this is handled differently depending on
 whether a singular or bulk call is made.
@@ -540,7 +540,7 @@ sub _as_form
 	$qf_params{action_name} = $action_name;
 
 	# - url
-	if ( !defined $request_url )
+	if ( !$request_url )
 	{
 		if ( $is_request && $access->is_set('referent_docid') )
 		{
@@ -973,7 +973,7 @@ sub _log
 Sends a ping to the configured Matomo Tracking HTTP API, representing a single
 access event.
 
-A request URL will be calculated if not provided.
+A request URL will be calculated if blank or undefined.
 
 Returns a log message indicating how it went.
 
@@ -1053,17 +1053,20 @@ sub _ping
 
 Records a failed ping attempt so it can be retried later.
 
+Stashing an event converts an undefined C<%request_url> to an empty string.
+
 =cut
 
 sub _stash
 {
 	my ( $self, $access, $request_url ) = @_;
+	$request_url //= q();
 	my $repo = $self->{repository};
 
 	my $panic_msg =
 		"_stash: Could not stash ping for access "
 	  . $access->id . " = "
-	  . $request_url;
+	  . ( $request_url || "???" );
 
 	my $replay_dir = $repo->config('variables_path') . REPLAY_DIR;
 
@@ -1134,6 +1137,7 @@ sub _unstash
 		open( my $fh, '<', "$replay_dir/$accessid" ) or next;
 		read( $fh, my $request_url, -s $fh );
 		close($fh) or warn "Failed to close $replay_dir/$accessid: $!";
+		$request_url =~ s/^\s+|\s+$//g;
 		push @accesses, [ $access, $request_url ];
 		unlink "$replay_dir/$accessid";
 	}
