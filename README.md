@@ -120,30 +120,29 @@ configuration.
 ## Operation
 
 The OAPing plugin works hard to ensure all pings get through to the tracker
-safely. Unsuccessful pings are saved to disk ("stashed") in the
+safely. Unsent or unsuccessful pings are saved to disk ("stashed") in the
 **ARCHIVE_ID/var/oaping/** directory to be retried later, and removed when they
 succeed.
 
 The `legacy_notify` job performs bulk requests in batches of configurable size.
 It defaults to sending a ping for each non-trivial Access DataObj in the
 database, though when you set it running you can choose how many of the
-chronologically earliest ones to skip. If an error occurs, any unsuccessful
-pings are stashed. If there are stashed pings, it will send them instead of
-looking up the next batch from the database.
+chronologically earliest ones to skip. If there are stashed pings, it will send
+them instead of looking up the next batch from the database.
 
 In notify mode 1, the `safe_notify` job will normally send a single ping to the
-tracker each time a new Access DataObj is added to the database; if this fails,
-the ping is stashed. If however there are stashed pings, they will be sent with
-the triggering ping in a bulk request. Similarly, if the job detects that the
-`legacy_notify` job has been run, it will look to see if any Access DataObjs
-were missed between the last `legacy_notify` run and the triggering Access
-DataObj, and if so send them with the triggering ping in a bulk request.
+tracker each time a new Access DataObj is added to the database. If however
+there are stashed pings, they will be sent with the triggering ping in a bulk
+request. Similarly, if the job detects that the `legacy_notify` job has been
+run, it will look to see if any Access DataObjs were missed between the last
+`legacy_notify` run and the triggering Access DataObj, and if so send them with
+the triggering ping in a bulk request; if there are too many to send in one go,
+the remainder are stashed.
 
 In notify mode 2, the `notify` job will send a single ping to the tracker each
-time a new Access DataObj is added to the database. If this fails, the ping is
-stashed and a `retry` job will be scheduled. The latter sends a batch of stashed
-pings in a bulk request; if there are any left over or an error occurred,
-unsent/unsuccessful pings are re-stashed and the job reschedules itself.
+time a new Access DataObj is added to the database. If this fails, a `retry` job
+will be scheduled. The latter sends a batch of stashed pings in a bulk request;
+if there are any left over, the job reschedules itself.
 
 ## Debugging
 
