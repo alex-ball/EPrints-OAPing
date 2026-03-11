@@ -846,7 +846,7 @@ sub _bulk_ping
 	my @unsent = @sorted_events;
 
 	if (   $response->header('Client-Warning')
-		&& $response->header('Client-Warning') eq 'Internal response"' )
+		&& $response->header('Client-Warning') eq 'Internal response' )
 	{
 		@sent  = ();
 		$error = 'Failed to send request';
@@ -1135,7 +1135,7 @@ sub _ping
 	my $error;
 	my %err_details;
 	if (   $response->header('Client-Warning')
-		&& $response->header('Client-Warning') eq 'Internal response"' )
+		&& $response->header('Client-Warning') eq 'Internal response' )
 	{
 		$error = 'Failed to send request';
 	}
