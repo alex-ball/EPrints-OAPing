@@ -848,8 +848,9 @@ sub _bulk_ping
 	if (   $response->header('Client-Warning')
 		&& $response->header('Client-Warning') eq 'Internal response' )
 	{
-		@sent  = ();
-		$error = 'Failed to send request';
+		@sent                  = ();
+		$error                 = 'Failed to send request';
+		$err_details{response} = $response->decoded_content();
 	}
 	elsif ( $response->code > 399 )
 	{
@@ -1138,6 +1139,7 @@ sub _ping
 		&& $response->header('Client-Warning') eq 'Internal response' )
 	{
 		$error = 'Failed to send request';
+		$err_details{response} = $response->decoded_content();
 	}
 	elsif ( $response->code > 399 )
 	{
