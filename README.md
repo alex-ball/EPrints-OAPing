@@ -16,8 +16,13 @@ You can install this extension in several different ways:
 
 ### As an ingredient
 
-Copy the `oaping` folder into your `~eprints/ingredients` folder, where
-`~eprints` is typically something like `/opt/eprints3`.
+Clone this Git repository inside your `~eprints/ingredients` folder, where
+`~eprints` is typically something like `/opt/eprints3`. It is recommended to
+simplify the directory name to `oaping`:
+
+```bash
+git clone git@github.com:alex-ball/EPrints-OAPing.git oaping
+```
 
 To activate the ingredient for given flavours, you can add a file to
 `~eprints/cfg/cfg.d` with lines like the following:
@@ -27,12 +32,18 @@ To activate the ingredient for given flavours, you can add a file to
 push @{ $conf->{flavours}->{FLAVOUR_NAME} }, 'ingredients/oaping';
 ```
 
+Alternatively you could add `ingredients/oaping` as a line inside your flavour's
+`inc` file, for example `~eprints/flavours/pub_lib/inc`, but that means having
+to stash or rebase when you pull in upstream changes with Git.
+
 ### As an extension
 
-Unpack the contents of the `oaping` folder into your
-`~eprints/archives/ARCHIVE_ID/cfg` folder.
+Unpack the contents of the `cfg.d` and `plugins` folders into their counterparts
+in your `~eprints/archives/ARCHIVE_ID/cfg` folder.
 
 ## Configuration
+
+### Credentials
 
 Create a file to contain your OpenAIRE tracking credentials:
 
@@ -41,6 +52,9 @@ Create a file to contain your OpenAIRE tracking credentials:
 $c->{oaping}->{idsite} = '';
 $c->{oaping}->{token_auth} = '';
 ```
+
+(You can call it whatever you like, within reason, but `x_` is a handy prefix
+for reminding you about the following security concerns.)
 
 It is recommended you exclude this file from any version control you might be
 using. It is also good practice to restrict access to the file so it can only be
@@ -52,12 +66,14 @@ chown eprints ~eprints/archives/ARCHIVE_ID/cfg/cfg_d/x_oaping.pl
 chmod 600 ~eprints/archives/ARCHIVE_ID/cfg/cfg_d/x_oaping.pl
 ```
 
+### Operation
+
 There are a few other configuration options. You should set these in one of the
 following places, according to taste:
 
--   alongside the credentials in **ARCHIVE_ID/cfg/cfg_d/x_oaping.pl**;
--   in a new file, **ARCHIVE_ID/cfg/cfg_d/z_oaping.pl**;
--   if it already exists, in **ARCHIVE_ID/cfg/cfg_d/oaping.pl** overwriting the
+-   alongside the credentials in `ARCHIVE_ID/cfg/cfg_d/x_oaping.pl`;
+-   in a new file, `ARCHIVE_ID/cfg/cfg_d/z_oaping.pl`;
+-   if it already exists, in `ARCHIVE_ID/cfg/cfg_d/oaping.pl` overwriting the
     values already there – if you've installed it as an ingredient, copy the
     file over first.
 
@@ -70,8 +86,9 @@ Options:
 
 -   `$c->{oaping}->{tracker}`
 
-    URL of the tracker to ping. Initial value is
+    URL of the tracker to ping. Initial value is the OpenAIRE tracker at
     `https://analytics.openaire.eu/piwik.php`.
+    You should however be able to use this plugin to ping any Matomo instance.
 
 -   `$c->{oaping}->{max_payload}`
 
@@ -82,13 +99,13 @@ Options:
 
 -   `$c->{oaping}->{verbosity}`
 
-    Set to 1 to record in the Indexer log each Access ID that is successfully
-    tracked. Initial value is 0 (succeed quietly).
+    Set to 1 to record in the Indexer log (or server error log) each Access ID
+    that is successfully tracked. Initial value is 0 (succeed quietly).
 
 -   `$c->{oaping}->{notify_mode}`
 
-    **NOTE:** This setting is only effective if you overwrite the value in
-    **oaping.pl**.
+    **NOTE:** This setting is only effective if you change the value where it
+    appears in the `oaping.pl` file provided.
 
     Set to 1 or 2 to install a trigger that pings the tracker when a new access
     event is logged in the database. Mode 1 does some checking before sending
@@ -103,16 +120,27 @@ Options:
     sudo -u eprints ~eprints/tools/schedule ARCHIVE_ID Event::OAPingEvent legacy_notify 0
     ```
 
-    This job will respawn after each bulk notification it makes. Once it reports
-    it is up to date, delete the job and set `notify_mode` to 1. A transition
-    will occur in which **ARCHIVE_ID/var/oaping-legacy.json** is renamed
-    **oaping-legacy.json.bak** and the **ARCHIVE_ID/var/oaping/** directory will
+    This job respawns after each bulk notification it makes.
+
+    - If the ping failed, the next job is be scheduled 1 hour later.
+    - If it succeeded and there are more Accesses to report, the next job is
+      scheduled 1 minute later.
+    - If it succeeded and there are no more Accesses to report, the next job is
+      scheduled 1 day later. You should see "Up to date" as the second
+      parameter for the job.
+    
+    It is fine, perhaps even preferable, to stay on mode 0 permanently. But if
+    you are up to date and want to switch to live pinging, delete the job and
+    set `notify_mode` to 1. A transition will occur in which the
+    `oaping-legacy.json` file in `ARCHIVE_ID/var/` is renamed
+    `oaping-legacy.json.bak` and the `ARCHIVE_ID/var/oaping/` directory will
     fill with files; when that directory is empty again, the transition is
     complete.
 
-    In any case, if using the trigger it is recommended that you choose mode 1
-    to begin with, and during any period where you notice problems occurring.
-    When things are running smoothly, switch to mode 2.
+    In any case, if using the live ping trigger it is recommended that you
+    choose mode 1 to begin with, and during any period where you notice problems
+    occurring. When things are running smoothly, switch to mode 2. No special
+    steps are needed when switching between modes 1 and 2.
 
 Remember to restart both the server and Indexer after changing the
 configuration.
@@ -121,7 +149,7 @@ configuration.
 
 The OAPing plugin works hard to ensure all pings get through to the tracker
 safely. Unsent or unsuccessful pings are saved to disk ("stashed") in the
-**ARCHIVE_ID/var/oaping/** directory to be retried later, and removed when they
+`ARCHIVE_ID/var/oaping/` directory to be retried later, and removed when they
 succeed.
 
 The `legacy_notify` job performs bulk requests in batches of configurable size.
