@@ -177,29 +177,27 @@ sub trigger_bulk_upload
 	close($fh) or warn "Failed to close $log_file: $!";
 
 	# kick off the indexer 
-	my $event = EPrints::DataObj::EventQueue->create_unique( $repo, {
+	my $event = EPrints::DataObj::EventQueue->create_from_data( $repo, {
 		pluginid => 'Event::MatomoEvent',
 		action => 'bulk_upload_batch',
-		params => [ "First run of $batch_name access", $batch_name, EPrints::Time::iso_datetime() ],
+		params => [ "First run of $batch_name access", $batch_name ],
 	});
 
 	return $event->get_value( "status" )
 
 }
 
-=item $status = $self->bulk_upload_batch( $self, [ $message, $batch_name, $unique_parameter ] )
+=item $status = $self->bulk_upload_batch( $self, [ $message, $batch_name ] )
 
 Notifies the tracker of a batch of legacy access records, starting at the access id of C<$last_accessid> from the log file.
 The C<$message> should be indicative of how the last run went;
 this is a bit of a cheat, in order to make it clear in the Indexer task screen when the legacy upload has finished.
 
-EventQueue->create_unique will return the same event if it has exactly the same parameters so C<$unique_parameter> exists purely so we definitely schedule another task.
-
 =cut
 
 sub bulk_upload_batch
 {
-	my ( $self, $message, $batch_name, $ignoreme ) = @_;
+	my ( $self, $message, $batch_name ) = @_;
 	my $repo = $self->{repository};
 	# Maximum number of events in one upload:
 	my $max_payload = $repo->config( 'matomo', 'max_payload' ) // 100;
@@ -310,13 +308,13 @@ sub bulk_upload_batch
 	$self->_log( "bulk_upload_batch: scheduling next run with message: ".$log->{message} );
 
 	# Spawn new job
-	my $task = EPrints::DataObj::EventQueue->create_unique(
+	my $task = EPrints::DataObj::EventQueue->create_from_data(
 		$self->{repository},
 		{
 			start_time => EPrints::Time::iso_datetime($start_stamp),
 			pluginid   => $self->get_id,
 			action     => "bulk_upload_batch",
-			params     => [ $log->{message}, $batch_name, EPrints::Time::iso_datetime() ]
+			params     => [ $log->{message}, $batch_name ]
 		}
 	);
 	$self->_log("bulk_upload_batch: new task status: " . $task->get_value( "status" ));
@@ -708,10 +706,10 @@ sub restart_batch
 
 	if(-e $log_file){
 		# log file exists, so the batch has run before
-		my $event = EPrints::DataObj::EventQueue->create_unique( $repo, {
+		my $event = EPrints::DataObj::EventQueue->create_from_data( $repo, {
 			pluginid => 'Event::MatomoEvent',
 			action => 'bulk_upload_batch',
-			params => [ "Restart batch $batch_name", $batch_name, EPrints::Time::iso_datetime() ],
+			params => [ "Restart batch $batch_name", $batch_name ],
 		});
 	
 		return $event->get_value( "status" );
