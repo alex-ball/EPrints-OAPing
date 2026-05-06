@@ -23,31 +23,39 @@ Relies on the following configuration settings:
 
 See L<EPrints::Plugin::Event> for standard methods.
 
-There are two different jobs provided, corresponding to two phases of
+There are four different jobs provided, corresponding to three phases of
 operation.
 
-With C<legacy_notify>, the job goes progresses through the entire table of
-access events. A fake-but-likely request URL is generated for each one. With
-each run of the job, a batch of up to 100 access events is sent to the tracker,
-progress is recorded in a log for safety, and the job respawns to send the next
-batch in 60 seconds. In the event of an error, the current batch is saved to a
-folder, and the job respawns in 60 minutes. On the next run, the saved batch is
-reloaded and and the request is retried. If the request does not succeed for 24
-hours, the job stops respawning; however, after a successful retry, normal
-operation resumes with the next batch. When spawning a new job, the status of
-the last run is included as a parameter for the sake of visibility, but is not
-otherwise used.
+With C<bulk_notify>, the job goes progresses through the entire table of access
+events. A fake-but-likely request URL is generated for each one. With each run
+of the job, a batch of access events (up to 100 by default) is sent to the
+tracker, progress is recorded in a log for safety, and the job respawns to send
+the next batch in 60 seconds. In the event of an error, the current batch is
+saved to a folder, and the job respawns in 60 minutes. On the next run, the
+saved batch is reloaded and and the request is retried. If the request does not
+succeed for 24 hours, the job stops respawning; however, after a successful
+retry, normal operation resumes with the next batch. When spawning a new job,
+the status of the last run is included as a parameter for the sake of
+visibility, but is not otherwise used.
 
-The C<notify> job is intended to be triggered each time a new access event is
-added to the database. Normally a HEAD request is sent to the tracker with the
-tracking information provided in the query string; on error, the access event is
-saved to a folder. If the job is run while there are saved access events, the
-saved ones are loaded and removed, the triggering event is added to them, and
-they are sent as a batch. If there are more than 100 to send in this way, only
-the first 100 are sent, and the rest are saved back to the folder.
+The C<fast_notify> job is intended to be triggered each time a new access event is
+added to the database. It sends a HEAD request to the tracker with the tracking
+information provided in the query string; on error, the access event is saved to a
+folder. The return value should be monitored, and if the request fails, a C<retry>
+job should be scheduled so the Indexer can perform a recovery operation.
 
-If the C<notify> job detects a log file left behind by C<legacy_notify>, it will
-load the access events between the last one sent by C<legacy_notify> and the
+The C<safe_notify> job is provided for transitioning between C<bulk_notify> and
+C<fast_notify>. If there are no saved access events and no C<bulk_notify> log
+file, it works just like C<fast_notify>.
+
+If there are saved access events, C<safe_notify> will instead load the saved
+events and remove them, add the triggering event to them, and send them as a
+batch. If there are more than the batch limit to send in this way, they are
+sorted chronologically, and later events beyond the limit are saved back to the
+folder.
+
+If the C<safe_notify> job detects a log file left behind by C<bulk_notify>, it will
+load the access events between the last one sent by C<bulk_notify> and the
 triggering event, and rename the log file. Then it will proceed in the same way
 as for error recovery.
 
@@ -64,6 +72,8 @@ our @ISA     = qw( EPrints::Plugin::Event );
 use File::Copy;
 use File::Path qw(make_path);
 use JSON;
+use LWP::ConnCache;
+use LWP::UserAgent;
 use POSIX qw(strftime);
 use URI;
 
@@ -74,17 +84,17 @@ use EPrints::Const
 
 =over
 
-=item LEGACY_LOG
+=item BULK_LOG
 
-Relative path to record of last legacy ping.
+Relative path to record of last bulk ping.
 
-=item RETRY_DIR
+=item REPLAY_DIR
 
 Relative path to folder of failed pings.
 
-=item RETRY_LOG
+=item ERROR_LOG
 
-Relative path to record of retry attempts.
+Relative path to record of errors and recovery.
 
 =item INVESTG
 
@@ -99,7 +109,8 @@ Activity name for COUNTER Requests.
 =cut
 
 use constant {
-	LEGACY_LOG => '/oaping-legacy.json',
+	BULK_LOG   => '/oaping-bulk.json',
+	SAFE_LOG   => '/oaping-safe.json',
 	REPLAY_DIR => '/oaping',
 	ERROR_LOG  => '/oaping-error.yaml',
 	INVESTG    => 'View',
@@ -138,57 +149,60 @@ sub new
 
 =over
 
-=item $status = $self->legacy_notify( $self, $offset, [ $message ] )
+=item $status = $self->bulk_notify( $self, [ $after_accessid, $message ] )
 
-Notifies the tracker of a batch of legacy access records, skipping the
-chronologically first C<$offset> records. The C<$message> should be indicative
-of how the last run went; this is a bit of a cheat, in order to make it clear
-in the Indexer task screen when the legacy upload has finished.
+Notifies the tracker of a batch of access records, specifically the ones with
+the lowest (earliest) C<accessid> values greater than C<$after_accessid>. Note
+that some access records may be invalid or missing from the database.
 
-(Internally C<$offset> is the 0-indexed number of the first record to include,
-but this is the same as skipping the first C<$offset> records).
+The C<$message> should be indicative of how the last run went; this is a bit
+of a cheat, in order to make it clear in the Indexer task screen when a backlog
+of access records has been cleared.
 
 =cut
 
-sub legacy_notify
+sub bulk_notify
 {
-	my ( $self, $offset, $message ) = @_;
+	my ( $self, $after_accessid, $message ) = @_;
 	my $repo = $self->{repository};
+	$after_accessid //= 0;
 
 	# Maximum number of events in one upload:
 	my $size = $repo->config( 'oaping', 'max_payload' ) // 100;
 
-	my $json    = JSON->new->allow_nonref(0)->canonical(1)->pretty(1);
-	my $logfile = $repo->config('variables_path') . LEGACY_LOG;
+	# Log file handling:
+	my $log_fp = $repo->config('variables_path') . BULK_LOG;
+	my $json   = JSON->new->allow_nonref(0)->canonical(1)->pretty(1);
 
 	# Read log if exists
 	my $log = { tries_since_last_success => 0 };
-	if ( -f $logfile )
+	if ( -f $log_fp )
 	{
-		open( my $fh, "<", $logfile ) or do
+		open( my $fh, "<", $log_fp ) or do
 		{
-			$self->_log("legacy_notify: Could not open $logfile: $!");
+			$self->_log("bulk_notify: Could not open $log_fp: $!");
 			return HTTP_INTERNAL_SERVER_ERROR;
 		};
 		my $err = read( $fh, my $logcontent, -s $fh );
 		if ( !defined $err )
 		{
-			$self->_log("legacy_notify: Could not read $logfile: $!");
+			$self->_log("bulk_notify: Could not read $log_fp: $!");
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
-		close($fh) or warn "Failed to close $logfile: $!";
+		close($fh) or warn "Failed to close $log_fp: $!";
 		$log = eval { $json->decode($logcontent) } or do
 		{
-			$self->_log("legacy_notify: Could not parse $logfile: $@");
+			$self->_log("bulk_notify: Could not parse $log_fp: $@");
 			return HTTP_INTERNAL_SERVER_ERROR;
 		};
 
 		# Offset should match logfile.
-		if ( exists $log->{offset} && $log->{offset} != $offset )
+		if ( exists $log->{last_accessid}
+			&& $log->{last_accessid} != $after_accessid )
 		{
 			$self->_log(
-					"legacy_notify: Offset mismatch, $log->{offset} (log) "
-				  . "!= $offset (call)" );
+				"bulk_notify: Access ID mismatch, $log->{last_accessid} (log) "
+				  . "!= $after_accessid (call)" );
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 	}
@@ -206,39 +220,18 @@ sub legacy_notify
 	}
 	else
 	{
-		# We can only register access events with a datestamp.
-		# We only want to register access events with a referent ID.
-		# Would be more robust to cache but probably too many results.
-		my %params = (
-			session       => $self->{repository},
-			dataset       => $self->_ds_acc,
-			search_fields => [
-				{ meta_fields => ['datestamp'],   match => 'SET' },
-				{ meta_fields => ['referent_id'], match => 'SET' },
-			],
-			custom_order => "datestamp/accessid",
-		);
-		my $search = EPrints::Search->new( %params, allow_blank => 1, );
-
-		my $results = $search->perform_search;
-		my $total   = $results->count;
-		$log->{total} = $total;
-
-		if ( $total > $offset )
+		@accesses =
+		  $self->_accesses_in_range( $after_accessid, count => $size );
+		if (@accesses)
 		{
-			for my $access ( $results->slice( $offset, $size ) )
-			{
-				$offset++;
-				push @accesses, [$access];
-				$log->{last_accessid} = $access->id
-				  if ( $access->id > $log->{last_accessid} );
-			}
-
-			$log->{offset}  = $offset;
-			$log->{message} = $self->_bulk_ping( \@accesses );
+			$log->{sent}          = scalar @accesses;
+			$after_accessid       = $accesses[-1][0]->id;
+			$log->{last_accessid} = $after_accessid;
+			$log->{message}       = $self->_bulk_ping( \@accesses );
 		}
-		else
+		if ( @accesses < $size )
 		{
+			# Incomplete batch means we've run out of records.
 			$log->{message} = $up_to_date;
 		}
 	}
@@ -264,13 +257,13 @@ sub legacy_notify
 	}
 
 	# Save log file
-	open( my $fh, ">", $logfile ) or do
+	open( my $fh, ">", $log_fp ) or do
 	{
-		$self->_log("legacy_notify: Could not open $logfile: $!");
+		$self->_log("bulk_notify: Could not open $log_fp: $!");
 		return HTTP_INTERNAL_SERVER_ERROR;
 	};
 	print $fh $json->encode($log);
-	close($fh) or warn "Failed to close $logfile: $!";
+	close($fh) or warn "Failed to close $log_fp: $!";
 
 	if ( $log->{tries_since_last_success} > 24 )
 	{
@@ -279,13 +272,13 @@ sub legacy_notify
 	}
 
 	# Spawn new job
-	EPrints::DataObj::EventQueue->create_unique(
+	EPrints::DataObj::EventQueue->create_from_data(
 		$self->{repository},
 		{
 			start_time => EPrints::Time::iso_datetime($start_stamp),
 			pluginid   => $self->get_id,
-			action     => "legacy_notify",
-			params     => [ $offset, $log->{message} ]
+			action     => "bulk_notify",
+			params     => [ $after_accessid, $log->{message} ]
 		}
 	);
 	return HTTP_OK;
@@ -309,57 +302,75 @@ sub safe_notify
 	my ( $self, $access, $request_url ) = @_;
 	my $repo = $self->{repository};
 
-	my $logfile = $repo->config('variables_path') . LEGACY_LOG;
-
 	# Maximum number of events in one upload:
 	my $size = $repo->config( 'oaping', 'max_payload' ) // 100;
 
+	# Log file handling:
+	my $bulk_log_fp = $repo->config('variables_path') . BULK_LOG;
+	my $safe_log_fp = $repo->config('variables_path') . SAFE_LOG;
+
+	my $json = JSON->new->allow_nonref(0)->canonical(1)->pretty(1);
 	my $msg;
 
-	# Recovery from previous runs
-	my @accesses;
-
-	if ( -f $logfile )
+	# Record that we're handling this access event:
+	my $safe_log = { last_accessid => $access->id };
+  LOGGING:
 	{
-		# Transitioning from legacy_notify:
-		open( my $fh, "<", $logfile ) or do
+		open( my $fh, ">", $safe_log_fp ) or do
 		{
-			$msg = "Could not open $logfile: $!";
+			$self->_log( "_safe_log: Processing Access "
+				  . $access->id
+				  . ", could not open $safe_log_fp: $!" );
+			last LOGGING;
+		};
+		print $fh $json->encode($safe_log);
+		close($fh) or warn "Failed to close $safe_log_fp: $!";
+	}
+
+	# Find any other events we need to upload:
+	my @accesses;
+	if ( -f $bulk_log_fp )
+	{
+		# Transitioning from bulk_notify:
+		open( my $fh, "<", $bulk_log_fp ) or do
+		{
+			$msg = "Could not open $bulk_log_fp: $!";
 			$self->_err_log( $msg, stashed => [ [ $access, $request_url ] ] );
-			$self->_log("notify: $msg");
+			$self->_log("safe_notify: $msg");
 			$self->_stash( $access, $request_url );
 			return HTTP_INTERNAL_SERVER_ERROR;
 		};
 		my $err = read( $fh, my $logcontent, -s $fh );
 		if ( !defined $err )
 		{
-			$msg = "Could not read $logfile: $!";
+			$msg = "Could not read $bulk_log_fp: $!";
 			$self->_err_log( $msg, stashed => [ [ $access, $request_url ] ] );
-			$self->_log("notify: $msg");
+			$self->_log("safe_notify: $msg");
 			$self->_stash( $access, $request_url );
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
-		close($fh) or warn "Failed to close $logfile: $!";
-		my $json = JSON->new->allow_nonref(0)->canonical(1)->pretty(1);
-		my $log  = eval { $json->decode($logcontent) } or do
+		close($fh) or warn "Failed to close $bulk_log_fp: $!";
+		my $bulk_log = eval { $json->decode($logcontent) } or do
 		{
-			$msg = "Could not parse $logfile: $@";
+			$msg = "Could not parse $bulk_log_fp: $@";
 			$self->_err_log( $msg, stashed => [ [ $access, $request_url ] ] );
-			$self->_log("notify: $msg");
+			$self->_log("safe_notify: $msg");
 			$self->_stash( $access, $request_url );
 			return HTTP_INTERNAL_SERVER_ERROR;
 		};
-		if ( !$log->{last_accessid} )
+		if ( !$bulk_log->{last_accessid} )
 		{
-			$msg = "Last legacy accessid not found in $logfile";
+			$msg = "Last bulk accessid not found in $bulk_log_fp";
 			$self->_err_log( $msg, stashed => [ [ $access, $request_url ] ] );
-			$self->_log("notify: $msg");
+			$self->_log("safe_notify: $msg");
 			$self->_stash( $access, $request_url );
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
-		@accesses =
-		  $self->_accesses_between( $log->{last_accessid}, $access->id );
-		move( $logfile, "$logfile.bak" );
+		@accesses = $self->_accesses_in_range( $bulk_log->{last_accessid},
+			before => $access->id );
+		my $total = scalar @accesses;
+		$self->_log("_safe_notify: Loaded $total transitional access records.");
+		move( $bulk_log_fp, "$bulk_log_fp.bak" );
 	}
 	else
 	{
@@ -373,14 +384,13 @@ sub safe_notify
 
 		if ( @accesses > $size )
 		{
-			# Bulk ping will sort entries, but if choosing, need to choose
-			# the earliest ones:
-			my @sorted_accesses = sort {
-				$a->[0]->value('datestamp') cmp $b->[0]->value('datestamp')
-			} @accesses;
+			# Bulk ping will sort entries, but if choosing,
+			# want to choose the earliest ones:
+			my @sorted_accesses =
+			  sort { $a->[0]->id cmp $b->[0]->id } @accesses;
 			my @batch = @sorted_accesses[ 0 .. ( $size - 1 ) ];
 			$msg = $self->_bulk_ping( \@batch, 1 );
-			$self->_log("notify call to _bulk_ping: $msg");
+			$self->_log("safe_notify call to _bulk_ping: $msg");
 
 			# Stash the remainder:
 			my @stashed;
@@ -397,7 +407,7 @@ sub safe_notify
 		else
 		{
 			$msg = $self->_bulk_ping( \@accesses, 1 );
-			$self->_log("notify call to _bulk_ping: $msg");
+			$self->_log("safe_notify call to _bulk_ping: $msg");
 		}
 
 		if ( $msg =~ m/^Sent/ )
@@ -416,26 +426,27 @@ sub safe_notify
 	{
 		if ( $repo->config( 'oaping', 'verbosity' ) )
 		{
-			$self->_log("notify: $msg");
+			$self->_log("safe_notify: $msg");
 		}
 		return HTTP_OK;
 	}
 	else
 	{
-		$self->_log("notify: $msg");
+		$self->_log("safe_notify: $msg");
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 }
 
-=item $status = $self->notify( $self, $access, $request_url )
+=item $status = $self->fast_notify( $self, $access, $request_url )
 
 Notifies the tracker about the given C<$access> event.
 
 In contrast to C<safe_notify>, does not check for previously missed pings.
+Error recovery is performed by C<retry> instead.
 
 =cut
 
-sub notify
+sub fast_notify
 {
 	my ( $self, $access, $request_url ) = @_;
 	my $repo = $self->{repository};
@@ -445,13 +456,13 @@ sub notify
 	{
 		if ( $repo->config( 'oaping', 'verbosity' ) )
 		{
-			$self->_log("notify: $msg");
+			$self->_log("fast_notify: $msg");
 		}
 		return HTTP_OK;
 	}
 	else
 	{
-		$self->_log("notify: $msg");
+		$self->_log("fast_notify: $msg");
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 }
@@ -539,44 +550,66 @@ sub retry
 
 =over
 
-=item @accesses = $self->_accesses_between( $last_accessid, $current_accessid )
+=item @accesses = $self->_accesses_in_range( $after_accessid, [before => $accessid, count => $count] )
 
-Loads all relevant access records I<after> the C<$last_accessid> but I<before>
-the C<$current_accessid> and returns them as an array of arrayrefs, where the
-only element is an C<$access> object (compatible with L<_unstash>).
+Loads relevant access records with an ID greater than C<$after_accessid>, in
+ascending ID order. The number of records loaded can be limited in two ways:
+
+=over
+
+=item before
+
+Only access records with an ID less than the given number will be included.
+
+=item count
+
+No more than the given number of records will be included.
+
+=back
+
+Records are returned as an array of arrayrefs in which the only element is
+an access record. (This is for compatibility with the C<$accesses> parameter
+of C<_bulk_ping>.)
 
 =cut
 
-sub _accesses_between
+sub _accesses_in_range
 {
-	my ( $self, $last_accessid, $current_accessid ) = @_;
+	my ( $self, $after_accessid, %params ) = @_;
 
-	my $range_start = $last_accessid + 1;
-	my $range_stop  = $current_accessid - 1;
-
-	my %params = (
+	my $range_start = $after_accessid + 1;
+	my $range       = "$range_start-";
+	if ( exists $params{before} )
+	{
+		my $range_stop = $params{before} - 1;
+		$range .= "$range_stop";
+	}
+	my %search_params = (
 		session       => $self->{repository},
 		dataset       => $self->_ds_acc,
 		search_fields => [
 			{
 				meta_fields => ['accessid'],
-				value       => "$range_start-$range_stop",
+				value       => $range,
 				match       => 'EQ',
 				merge       => 'ANY'
 			},
 			{ meta_fields => ['datestamp'],   match => 'SET' },
 			{ meta_fields => ['referent_id'], match => 'SET' },
 		],
-		custom_order => "datestamp/accessid",
+		custom_order => "accessid",
 		allow_blank  => 1
 	);
-	my $search  = EPrints::Search->new(%params);
+	my $search  = EPrints::Search->new(%search_params);
 	my $results = $search->perform_search;
-	my $total   = $results->count;
-	$self->_log("_accesses_between: Loading $total access records.");
 
+	my @slice_params = (0);
+	if ( exists $params{count} )
+	{
+		push @slice_params, $params{count};
+	}
 	my @accesses;
-	foreach my $access ( $results->slice() )
+	foreach my $access ( $results->slice(@slice_params) )
 	{
 		push @accesses, [$access];
 	}
@@ -585,7 +618,7 @@ sub _accesses_between
 
 =item ($id1, $id2) | $id2 = $self->_archive_id ( $any )
 
-Takes Boolean. If true, returns an array containing both the v1 and v2
+Takes a Boolean. If true, returns an array containing both the v1 and v2
 OAI identifiers for the current archive. Otherwise just returns the v2
 one.
 
@@ -760,7 +793,10 @@ plugin.
 If C<$is_recovery> evaluates true, successfully sent access events will be
 logged, so they can be compared against the lists of previously stashed ones.
 
-Any events that failed to send are stashed.
+If no events are successfully tracked, the entire batch is stashed so that it
+can be retried. If some are tracked and some are not, the ones the tracker
+marked as invalid are logged (if possible) but not retried, since it is
+unlikely to be a temporary glitch.
 
 Returns a log message indicating how it went.
 
@@ -811,9 +847,10 @@ sub _bulk_ping
 	}
 
 	# Sort all events into chronological order
-	# (they will already be ordered if from database search,
+	# (they should already be ordered if from database search,
 	# but not if rescued from the stash):
 	my @sorted_events = sort { $a->{p}{cdt} cmp $b->{p}{cdt} } @events;
+	my $total_tried   = scalar @sorted_events;
 
 	# According to BulkTracking/Tracker/Requests.php, each member of
 	# the requests array can be either be a URL string (in which case
@@ -840,61 +877,183 @@ sub _bulk_ping
 		Content      => $content,
 	);
 
-	my $error;
+	my @errors;
 	my %err_details;
-	my @sent   = @sorted_events;
-	my @unsent = @sorted_events;
+	my $num_tracked = 0;
+	my $num_invalid = 0;
+	my @sent;
+	my @stashed;
+	my @failed;
 
-	if (   $response->header('Client-Warning')
-		&& $response->header('Client-Warning') eq 'Internal response' )
+  INTERPRET:
 	{
-		@sent                  = ();
-		$error                 = 'Failed to send request';
-		$err_details{response} = $response->decoded_content();
-	}
-	elsif ( $response->code > 399 )
-	{
-		$error =
-		  'Tracker responded ' . $response->code . ' ' . $response->message;
-		$err_details{response} = $response->decoded_content();
-		my $report = eval { $json->decode( $response->content() ) }
-		  or $error .= '. Could not parse content of response.';
-		my $tracked = 0;
-		if ( $report && exists $report->{tracked} )
+
+		if (   $response->header('Client-Warning')
+			&& $response->header('Client-Warning') eq 'Internal response' )
 		{
-			$tracked = $report->{tracked};
+			# Fake response, total failure:
+			push @errors, 'Failed to send request';
+			$err_details{response} = $response->decoded_content();
+			@stashed = @sorted_events;
+			last INTERPRET;
 		}
-		@sent   = $tracked ? @sorted_events[ 0 .. ( $tracked - 1 ) ] : ();
-		@unsent = @sorted_events[ $tracked .. $#sorted_events ];
+
+		# Something went badly wrong, but we investigate further.
+		if ( $response->code > 399 )
+		{
+			push @errors,
+				'Tracker responded '
+			  . $response->code . q( )
+			  . $response->message . q(.);
+			$err_details{response} = $response->decoded_content();
+		}
+
+		my $report;
+		$report = eval { $json->decode( $response->content() ) } or do
+		{
+			# Not JSON response, assume total failure.
+			if ( !@errors )
+			{
+				push @errors, 'Could not parse content of response.';
+			}
+			@stashed = @sorted_events;
+			last INTERPRET;
+		};
+
+		if (   !defined $report->{status}
+			|| !defined $report->{tracked}
+			|| !defined $report->{invalid} )
+		{
+			# JSON is strange, assume total failure.
+			if ( !@errors )
+			{
+				push @errors,
+				  'Tracker did not respond with expected JSON format.';
+			}
+			@stashed = @sorted_events;
+			last INTERPRET;
+		}
+
+		# If status eq 'error', the following two numbers probably won't add
+		# to the expected total, but we can handle that directly.
+		$num_tracked = $report->{tracked};
+		$num_invalid = $report->{invalid};
+
+		if ( $num_tracked == $total_tried )
+		{
+			# All events reported as tracked.
+			@sent = @sorted_events;
+			last INTERPRET;
+		}
+
+		if ( $num_tracked == 0 )
+		{
+			# No events reported as tracked.
+			if ( !@errors )
+			{
+				push @errors,
+				  "Tried sending $total_tried events but none tracked; "
+				  . 'will retry.';
+			}
+			@stashed = @sorted_events;
+			last INTERPRET;
+		}
+
+		# Some but not all events have been tracked:
+		if ( exists $report->{invalid_indices} )
+		{
+			# Should already be sorted, but in case of weirdness:
+			push @errors, "Discarded $num_invalid invalid events.";
+			my @invalid_indices =
+			  sort { $a <=> $b } @{ $report->{invalid_indices} };
+
+			for ( my $i = 0 ; $i < $total_tried ; $i++ )
+			{
+				if ( @invalid_indices && $i == $invalid_indices[0] )
+				{
+					# Definitely invalid
+					push @failed, $sorted_events[ shift @invalid_indices ];
+				}
+				elsif ( scalar @sent < $num_tracked )
+				{
+					# Definitely tracked
+					push @sent, $sorted_events[$i];
+				}
+				else
+				{
+					# Tracker crashed before processing this one?
+					push @stashed, $sorted_events[$i];
+				}
+			}
+		}
+		else
+		{
+			push @errors,
+			  "Discarded $num_invalid invalid events (unspecified).";
+
+			# Record all processed events under sent.
+			my $num_processed = $num_tracked + $num_invalid;
+			if ( $num_processed < $total_tried )
+			{
+				# Tracker crashed? Stash events it didn't process:
+				my $events_skipped = $total_tried - $num_processed;
+				push @errors, "Will retry $events_skipped skipped events.";
+				@sent    = @sorted_events[ 0 .. ( $num_processed - 1 ) ];
+				@stashed = @sorted_events[ $num_processed .. $#sorted_events ];
+			}
+			else
+			{
+				@sent = @sorted_events;
+			}
+		}
+	}
+
+	# C<bulk_notify> looks for $ok_msg at start of $msg.
+	my $ok_msg = "Sent $num_tracked events to tracker.";
+	if (@errors)
+	{
+		if (@stashed)
+		{
+			# Trigger wait before retrying.
+			if (@sent)
+			{
+				push @errors, $ok_msg;
+			}
+		}
+		else
+		{
+			# Carry on at regular pace.
+			unshift @errors, $ok_msg;
+		}
+		$msg = join( q( ), @errors );
 	}
 	else
 	{
-		@unsent = ();
+		$msg = $ok_msg;
 	}
 
-	foreach my $event (@unsent)
+	foreach my $event (@stashed)
 	{
 		push @{ $err_details{stashed} }, [ $event->{a}, $event->{u} ];
 		$self->_stash( $event->{a}, $event->{u} );
 	}
 
-	$msg = "Sent ${\scalar @sent} events to tracker";
-	my $log_msg = $error ? $error : $msg;
-
-	if ($is_recovery)
+	foreach my $event (@failed)
 	{
-		foreach my $event (@sent)
-		{
-			push @{ $err_details{sent} }, [ $event->{a}, $event->{u} ];
-		}
-		$self->_err_log( $log_msg, %err_details );
-	}
-	elsif ($error)
-	{
-		$self->_err_log( $log_msg, %err_details );
+		push @{ $err_details{failed} }, [ $event->{a}, $event->{u} ];
 	}
 
-	return $log_msg;
+	foreach my $event (@sent)
+	{
+		push @{ $err_details{sent} }, [ $event->{a}, $event->{u} ];
+	}
+
+	if ( $is_recovery || @errors )
+	{
+		$self->_err_log( $msg, %err_details );
+	}
+
+	return $msg;
 }
 
 =item $ds = $self->_ds_acc
@@ -1011,6 +1170,11 @@ is an Access DataObj and the second (if present) is a request URL.
 Access events that have been stashed instead of being sent. Value should be as
 for B<sent>.
 
+=item failed
+
+Access events that Matomo rejected, and will not be retried. Value should be as
+for B<sent>.
+
 =item response
 
 Body of the error response sent back by Matomo.
@@ -1037,7 +1201,7 @@ sub _err_log
 			push @lines, "  $response_line";
 		}
 	}
-	foreach my $key ( 'sent', 'stashed' )
+	foreach my $key ( 'sent', 'stashed', 'failed' )
 	{
 		if ( defined $params{$key} )
 		{
@@ -1066,7 +1230,7 @@ sub _err_log
 
 =item $self->_log( $msg )
 
-Write message to Indexer log.
+Write message to Indexer or server log.
 
 =cut
 
@@ -1117,7 +1281,8 @@ sub _ping
 		if ( exists $qf_params{cdt} )
 		{
 			$self->_stash( $access, $request_url );
-			my $error = 'Could not notify of dated access without token_auth';
+			my $error =
+			  'Could not fast_notify of dated access without token_auth';
 			$self->_err_log( $error, stashed => [ [ $access, $request_url ] ] );
 			return $error;
 		}
@@ -1130,7 +1295,7 @@ sub _ping
 		}
 	}
 
-	$tracker_url->query_form(%qf_params);
+	$tracker_url->query_form( \%qf_params );
 
 	my $response = $self->_ua->head($tracker_url);
 	my $error;
@@ -1210,7 +1375,8 @@ sub _ua
 
 	if ( !defined $self->{ua} )
 	{
-		$self->{ua} = LWP::UserAgent->new( conn_cache => LWP::ConnCache->new );
+		my $conn_cache = LWP::ConnCache->new();
+		$self->{ua} = LWP::UserAgent->new( conn_cache => $conn_cache );
 		$self->{ua}->env_proxy;
 	}
 
@@ -1221,6 +1387,7 @@ sub _ua
 
 Loads and removes stashed access events and returns them as an array of arrayrefs,
 where the first element is an C<$access> object and the second is a request URL.
+(This is for compatibility with the C<$accesses> parameter of C<_bulk_ping>.)
 Elements are not likely to be in chronological order.
 
 =cut

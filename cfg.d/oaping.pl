@@ -63,19 +63,30 @@ $c->{oaping}->{verbosity} = 0;
 
 =item $c->{oaping}->{notify_mode}
 
-If you are installing the plugin into a running repository and want to send
-tracking information for historic Accesses, leave C<notify_mode> set to 0 and
-run the C<legacy_notify> job as your first step. Set C<notify_mode> to 1 once
-the C<legacy_notify> job reports it is up to date.
+The plugin can work in three different modes, selected by setting C<notify_mode>
+to 0, 1, or 2.
 
-Otherwise, set C<notify_mode> to 1 to start tracking new Accesses immediately.
-This setting installs a trigger that activates when a new access event is logged
-in the database.
+In mode 0, the indexer sends usage information to the tracker in bulk. Since it
+works from the EPrints Access table, it does not have access to the actual URL
+used to request landing pages and files, so it calculates the most likely one.
+This mode is recommended for busy repositories.
 
-When you are happy that everything is working, you can set C<notify_mode> to 2.
-This is more efficient than mode 1 but does not handle the transition from
-C<legacy_notify> and, when recovering from errors, new pings will likely be sent
-before older failed pings are retried.
+You need to set mode 0 running manually using the command-line C<schedule> tool.
+The job needs plugin ID C<Event::OAPingEvent>, action C<bulk_notify>, with a
+parameter being the Access ID of the I<last> access event to I<skip>. If you
+want to upload your entire history of accesses, the parameter should be C<0>.
+
+In mode 2, the web server will ping the tracker immediately as part of handling
+every access request. In case of error it will schedule a C<retry> indexer job.
+This mode is recommended for quiet repositories, once any historic access data
+of interest has been uploaded using mode 0.
+
+Mode 1 is designed for transitioning from mode 0 to mode 2 or vice versa. When
+an access event occurs, it will first check to see if there are older events to
+send, and if so send them in bulk (like the C<bulk_notify> and C<retry> jobs)
+with the new event added to the end; otherwise it sends the event to the tracker
+just as in mode 2. It writes out the Access ID of new access event it sent, so
+you can use it as the parameter to C<bulk_notify> after transitioning to mode 0.
 
 =cut
 
@@ -99,7 +110,7 @@ if ( $c->{oaping}->{notify_mode} == 2 )
 			my $canonical_url = $request_url->canonical()->as_string();
 
 			my $plugin = $repo->plugin('Event::OAPingEvent');
-			my $status = $plugin->notify( $access, $canonical_url );
+			my $status = $plugin->fast_notify( $access, $canonical_url );
 
 			if ( $status != EPrints::Const::HTTP_OK )
 			{
@@ -157,8 +168,8 @@ To help with debugging, the plugin writes one or two dedicated log files:
 
 =item <archive>/var/oaping-legacy.json
 
-This records information about the last run of the C<legacy_notify> job. It is
-also used when transitioning from that job to the normal C<notify> job.
+This records information about the last run of the C<bulk_notify> job. It is
+also used when transitioning from that job to the normal C<fast_notify> job.
 
 =item <archive>/var/oaping-error.json
 

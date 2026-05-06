@@ -113,12 +113,15 @@ Options:
     details. The initial value is 0 (don't install a trigger).
 
     If you are installing the plugin into a running repository and want to send
-    tracking information for historic Accesses, leave `notify_mode` set to 0
-    and run the `legacy_notify` job as your first step:
+    tracking information for historic Accesses, leave `notify_mode` set to 0 and
+    run the `bulk_notify` job as your first step:
 
     ```bash
-    sudo -u eprints ~eprints/tools/schedule ARCHIVE_ID Event::OAPingEvent legacy_notify 0
+    sudo -u eprints ~eprints/tools/schedule ARCHIVE_ID Event::OAPingEvent bulk_notify 0
     ```
+
+    (If you want to start uploading from a later point, replace the final 0 with
+    the ID of the last Access you want to skip.)
 
     This job respawns after each bulk notification it makes.
 
@@ -126,21 +129,25 @@ Options:
     - If it succeeded and there are more Accesses to report, the next job is
       scheduled 1 minute later.
     - If it succeeded and there are no more Accesses to report, the next job is
-      scheduled 1 day later. You should see "Up to date" as the second
-      parameter for the job.
+      scheduled 1 day later. You should see "Up to date" as the second parameter
+      for the job.
     
     It is fine, perhaps even preferable, to stay on mode 0 permanently. But if
     you are up to date and want to switch to live pinging, delete the job and
     set `notify_mode` to 1. A transition will occur in which the
-    `oaping-legacy.json` file in `ARCHIVE_ID/var/` is renamed
-    `oaping-legacy.json.bak` and the `ARCHIVE_ID/var/oaping/` directory will
-    fill with files; when that directory is empty again, the transition is
-    complete.
+    `oaping-bulk.json` file in `ARCHIVE_ID/var/` is renamed
+    `oaping-bulk.json.bak` and the `ARCHIVE_ID/var/oaping/` directory will fill
+    with files; when that directory is empty again, the transition is complete.
 
-    In any case, if using the live ping trigger it is recommended that you
-    choose mode 1 to begin with, and during any period where you notice problems
-    occurring. When things are running smoothly, switch to mode 2. No special
-    steps are needed when switching between modes 1 and 2.
+    You can switch freely between modes 1 and 2. If you are using live pings,
+    it is recommended to use mode 1 in the first instance and during problematic
+    periods (e.g. the tracker goes offline for maintenance), otherwise mode 2.
+
+    If you are using live pings and want to switch to bulk pings, run in mode 1
+    until a file `oaping-safe.json` file is generated or updated in
+    `ARCHIVE_ID/var/`. Then switch to mode 0, and schedule the `bulk_notify`
+    action as described above, using the access ID recorded in
+    `oaping-safe.json` as the parameter.
 
 Remember to restart both the server and Indexer after changing the
 configuration.
@@ -152,25 +159,25 @@ safely. Unsent or unsuccessful pings are saved to disk ("stashed") in the
 `ARCHIVE_ID/var/oaping/` directory to be retried later, and removed when they
 succeed.
 
-The `legacy_notify` job performs bulk requests in batches of configurable size.
-It defaults to sending a ping for each non-trivial Access DataObj in the
-database, though when you set it running you can choose how many of the
-chronologically earliest ones to skip. If there are stashed pings, it will send
-them instead of looking up the next batch from the database.
+The `bulk_notify` job performs bulk requests in batches of configurable size. It
+defaults to sending a ping for each non-trivial Access DataObj in the database,
+though when you set it running you can choose how many of the chronologically
+earliest ones to skip. If there are stashed pings, it will send them instead of
+looking up the next batch from the database.
 
 In notify mode 1, the `safe_notify` job will normally send a single ping to the
 tracker each time a new Access DataObj is added to the database. If however
 there are stashed pings, they will be sent with the triggering ping in a bulk
-request. Similarly, if the job detects that the `legacy_notify` job has been
-run, it will look to see if any Access DataObjs were missed between the last
-`legacy_notify` run and the triggering Access DataObj, and if so send them with
+request. Similarly, if the job detects that the `bulk_notify` job has been run,
+it will look to see if any Access DataObjs were missed between the last
+`bulk_notify` run and the triggering Access DataObj, and if so send them with
 the triggering ping in a bulk request; if there are too many to send in one go,
 the remainder are stashed.
 
-In notify mode 2, the `notify` job will send a single ping to the tracker each
-time a new Access DataObj is added to the database. If this fails, a `retry` job
-will be scheduled. The latter sends a batch of stashed pings in a bulk request;
-if there are any left over, the job reschedules itself.
+In notify mode 2, the `fast_notify` job will send a single ping to the tracker
+each time a new Access DataObj is added to the database. If this fails, a
+`retry` job will be scheduled. The latter sends a batch of stashed pings in a
+bulk request; if there are any left over, the job reschedules itself.
 
 ## Debugging
 
@@ -178,8 +185,8 @@ To help with debugging, the plugin writes one or two dedicated log files:
 
 -   **ARCHIVE_ID/var/oaping-legacy.json**
 
-    This records information about the last run of the `legacy_notify` job. It
-    is also used when transitioning from that job to the normal `notify` job,
+    This records information about the last run of the `bulk_notify` job. It is
+    also used when transitioning from that job to the normal `fast_notify` job,
     after which it is renamed.
 
 -   **ARCHIVE_ID/var/oaping-error.json**
